@@ -1,0 +1,197 @@
+import json
+import os
+from typing import List, Dict, Any
+
+try:
+    from pyspark.dbutils import DBUtils  # If running inside Databricks
+except ImportError:
+    DBUtils = None  # For local tests
+
+
+class Orchestrator:
+    """
+    Orchestrator to distribute job-level parameters to tasks.
+    - Round-robin distribution of job_params across tasks.
+    - update_job_params() sets task_distribution in dbutils.widgets.
+    """
+
+    def __init__(self, name: str, task_config: List[Dict[str, Any]]):
+        try:
+            if not isinstance(task_config, list) or not all(isinstance(t, dict) for t in task_config):
+                raise ValueError("task_config must be a list of dicts with at least 'task_name'")
+            self.name = name
+            self.task_config = task_config
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize Orchestrator: {e}") from e
+
+    def parallelize(self, job_params: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Round-robin distribute job_params to each task.
+        Each task will get a slice of the overall work.
+        """
+        try:
+            if not isinstance(job_params, dict):
+                raise ValueError("job_params must be a dict")
+
+            # Example: job_params contains a list we want to distribute (e.g., file_ids)
+            work_items = job_params.get("work_items", [])
+            if not isinstance(work_items, list):
+                raise ValueError("job_params['work_items'] must be a list")
+
+            num_tasks = len(self.task_config)
+            if num_tasks == 0:
+                raise ValueError("No tasks in task_config")
+
+            parallelized: Dict[str, List[Dict[str, Any]]] = {t["task_name"]: [] for t in self.task_config}
+
+            for idx, item in enumerate(work_items):
+                task_name = self.task_config[idx % num_tasks]["task_name"]
+                # Attach the item to job_params copy
+                p = job_params.copy()
+                p["work_item"] = item
+                parallelized[task_name].append(p)
+
+            return parallelized
+        except Exception as e:
+            raise RuntimeError(f"Error in parallelize(): {e}") from e
+
+    def update_job_params(self, parallelized: Dict[str, List[Dict[str, Any]]]) -> None:
+        """
+        Instead of returning job params, push the distribution into dbutils.widgets
+        so tasks can pick up their slice of work.
+        """
+        try:
+            if DBUtils is None:
+                raise RuntimeError("dbutils not available; must be run in Databricks")
+
+            dbutils.widgets.removeAll()
+            dbutils.widgets.text("task_distribution", json.dumps(parallelized))
+        except Exception as e:
+            raise RuntimeError(f"Error in update_job_params(): {e}") from e
+
+    def validate_tasks_exist(self) -> bool:
+        """
+        Placeholder for DBX Jobs API validation.
+        """
+        try:
+            return all(isinstance(t, dict) and "task_name" in t for t in self.task_config)
+        except Exception as e:
+            raise RuntimeError(f"Error in validate_tasks_exist(): {e}") from e
+
+
+if __name__ == "__main__":
+    try:
+        cfg_path = os.path.join(os.path.dirname(__file__), "task_config.json")
+        with open(cfg_path, "r") as f:
+            task_cfg = json.load(f)
+
+        orch = Orchestrator("orchestrator_btos", task_cfg)
+
+        job_params = {
+            "stage_name": "brz_to_sil",
+            "current_catalog": "dev_catalog",
+            "work_items": ["fileA", "fileB", "fileC", "fileD"]
+        }
+
+        parallelized = orch.parallelize(job_params)
+        print("Round-robin distribution:", json.dumps(parallelized, indent=2))
+
+    except Exception as exc:
+        print(f"❌ Orchestrator self-test failed: {exc}")
+------------------------------------------------------------------------------------------------------------------
+import json
+from pathlib import Path
+from typing import Dict, Any
+from app.app_utils.general_orchestrator.orchestrator import Orchestrator
+
+
+def load_task_config() -> list:
+    try:
+        cfg_path = Path(__file__).parent / "task_config.json"
+        with cfg_path.open("r") as f:
+            return json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Error loading task_config.json: {e}") from e
+
+
+def get_job_params_from_job() -> Dict[str, Any]:
+    """
+    Replace this with actual Databricks job parameter ingestion.
+    Must include:
+      - stage_name (str)
+      - current_catalog (str)
+      - work_items (list of items to distribute)
+    """
+    try:
+        return {
+            "stage_name": "brz_to_sil",
+            "current_catalog": "dev_catalog",
+            "work_items": ["fileA", "fileB", "fileC", "fileD", "fileE"]
+        }
+    except Exception as e:
+        raise RuntimeError(f"Error building job params: {e}") from e
+
+
+def build_query(stage_name: str, current_catalog: str) -> str:
+    """
+    Query template for downstream tasks.
+    """
+    return f"""
+    SELECT
+        cnf.file_id,
+        cnf.is_incr_load,
+        cnf.bronze_table_name,
+        cnf.silver_table_name,
+        cnf.silver_table_country_column,
+        COLLECT_LIST(aud.run_id) AS run_ids,
+        DATE_FORMAT(
+            TO_TIMESTAMP(aud.process_start_date_time, "yyyy-MM-dd'T'HH:mm:ss-SSSXXX"),
+            "yyyy-MM-dd"
+        ) AS run_date,
+        SUM(aud.num_output_records) AS num_output_records
+    FROM {current_catalog}.configuration.cfg_ibf_inbound_files cnf
+    INNER JOIN {current_catalog}.audit.aud_ibf_execution_log aud
+        ON cnf.file_id = aud.file_id
+    WHERE cnf.is_active = true
+      AND aud.status = 'success'
+      AND aud.run_id NOT IN (
+            SELECT EXPLODE(sc_run_ids)
+            FROM {current_catalog}.audit.aud_trf_execution_log
+            WHERE enable_reprocess = false
+              AND stage_name = '{stage_name}'
+              AND LOWER(status) = 'success'
+      )
+    GROUP BY
+        cnf.file_id,
+        cnf.is_incr_load,
+        cnf.bronze_table_name,
+        cnf.silver_table_name,
+        cnf.silver_table_country_column,
+        run_date
+    ORDER BY cnf.file_id
+    """.strip()
+
+
+def main():
+    try:
+        task_config = load_task_config()
+        orchestrator = Orchestrator("orchestrator_btos", task_config)
+
+        job_params = get_job_params_from_job()
+
+        parallelized = orchestrator.parallelize(job_params)
+
+        # Push task distribution into widgets for tasks
+        orchestrator.update_job_params(parallelized)
+
+        # Query building handled here
+        query = build_query(job_params["stage_name"], job_params["current_catalog"])
+        print("\n✅ Generated Query:\n", query)
+
+    except Exception as e:
+        print(f"❌ Orchestration failed: {e}")
+
+
+if __name__ == "__main__":
+    main()
+
